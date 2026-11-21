@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS baseline_events (
     batch_no  TEXT NOT NULL,
     baselines_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversion_tables (
+    table_no         TEXT PRIMARY KEY,
+    payload_json     TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    source_paper     TEXT NOT NULL,
+    baseline_paper   TEXT NOT NULL,
+    version_used     INTEGER NOT NULL,
+    version_current  INTEGER NOT NULL,
+    objective        REAL NOT NULL,
+    created_at       TEXT NOT NULL
+);
 """
 
 
@@ -181,6 +193,16 @@ class Database:
     def list_versions(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM versions ORDER BY version").fetchall()
 
+    def get_conversion_table(self, conn: sqlite3.Connection, table_no: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM conversion_tables WHERE table_no = ?", (table_no,)
+        ).fetchone()
+
+    def list_conversion_tables(self, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM conversion_tables ORDER BY created_at, table_no"
+        ).fetchall()
+
     # ---------- 写入 ----------
 
     def insert_version(
@@ -236,4 +258,29 @@ class Database:
             "UPDATE reports SET status = 'withdrawn', wd_batch = ?, wd_version = ?"
             " WHERE report_no = ?",
             (batch_no, version, report_no),
+        )
+
+    def insert_conversion_table(
+        self,
+        conn: sqlite3.Connection,
+        table_no: str,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT INTO conversion_tables("
+            " table_no, payload_json, result_json, source_paper, baseline_paper,"
+            " version_used, version_current, objective, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                table_no,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                json.dumps(result, ensure_ascii=False, sort_keys=True),
+                result["source_paper"],
+                result["baseline_paper"],
+                result["version_used"],
+                result["version_current"],
+                result["objective"],
+                result["created_at"],
+            ),
         )

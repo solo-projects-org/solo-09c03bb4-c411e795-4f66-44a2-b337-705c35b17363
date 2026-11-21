@@ -1,15 +1,16 @@
-"""业务服务层：批次生效、资格重算、回执生成、幂等重放。"""
+"""业务服务层：批次生效、资格重算、回执生成、幂等重放、换算码表发布。"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from . import graph
-from .db import Database
+from . import conversion, graph
+from .db import Database, utc_now_iso
 from .schemas import (
     BatchReceipt,
     BatchSubmitRequest,
+    ConversionTableSubmitRequest,
     Qualification,
     ReportRegister,
     ReportView,
@@ -250,3 +251,219 @@ class QualificationService:
             receipt = json.loads(row["receipt_json"])
             receipt["replayed"] = False
             return receipt
+
+
+def canonical_table_payload(req: ConversionTableSubmitRequest) -> str:
+    """归一化码表载荷：同号原样重送据此判定（同号异文拒收）。
+
+    记录按原分排序后参与比较（记录集合无序），报告单号保持填写顺序（链有序）。
+    """
+    payload = {
+        "table_no": req.table_no,
+        "source_paper": req.source_paper,
+        "baseline_paper": req.baseline_paper,
+        "version_used": req.version_used,
+        "report_nos": list(req.report_nos),
+        "records": sorted(
+            (r.model_dump() for r in req.records),
+            key=lambda r: r["original_score"],
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+class ConversionService:
+    """换算码表：发布（含报告链校验与最优换算）、两向查询、幂等重放。"""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    # ---------- 发布 ----------
+
+    def publish(self, req: ConversionTableSubmitRequest) -> dict[str, Any]:
+        canonical = canonical_table_payload(req)
+
+        # 请求级校验（不依赖库状态）
+        if req.source_paper == req.baseline_paper:
+            raise ApiError(422, "same_paper", "来源卷与基准卷不能相同")
+        if len(set(req.report_nos)) != len(req.report_nos):
+            raise ApiError(422, "duplicate_report_in_chain", "报告链中单号重复")
+        originals = [r.original_score for r in req.records]
+        if len(set(originals)) != len(originals):
+            raise ApiError(422, "duplicate_original",
+                           "同一原分只能填一条记录（同一原分统一换算）")
+
+        with self.db.write_transaction() as conn:
+            # 幂等：同号原样重送取原码表（即使链上报告此后已撤回）；
+            # 同号异文拒收，不产生新码表。
+            existing = self.db.get_conversion_table(conn, req.table_no)
+            if existing is not None:
+                if existing["payload_json"] != canonical:
+                    raise ApiError(409, "table_conflict",
+                                   f"码表号 {req.table_no} 已发布且内容不同（同号异文拒收）")
+                result = json.loads(existing["result_json"])
+                result["replayed"] = True
+                return result
+
+            self._validate_chain(conn, req)
+            result = self._build_result(conn, req)
+            # 校验、求解、写入在同一事务内：任一步失败整体回滚，不产生新码表
+            self.db.insert_conversion_table(
+                conn, req.table_no, json.loads(canonical), result)
+            return result
+
+    def _validate_chain(self, conn, req: ConversionTableSubmitRequest) -> None:
+        """报告链须在所用版和当前版都有效，并从来源卷接到两版共同的基准卷。"""
+        latest = self.db.latest_version(conn)
+        if latest == 0:
+            raise ApiError(404, "no_version", "尚无任何生效批次，无法发布换算码表")
+        if req.version_used > latest:
+            raise ApiError(404, "version_not_found",
+                           f"所用版 {req.version_used} 不存在，最近生效版为 {latest}")
+
+        used_baselines = set(self.db.baselines_at(conn, req.version_used))
+        current_baselines = set(self.db.baselines_at(conn, latest))
+        if req.baseline_paper not in used_baselines or req.baseline_paper not in current_baselines:
+            raise ApiError(
+                409, "baseline_not_common",
+                f"基准卷 {req.baseline_paper} 不是两版共同的基准卷："
+                f"所用版 {req.version_used} 的基准卷为 {sorted(used_baselines)}，"
+                f"当前版 {latest} 的基准卷为 {sorted(current_baselines)}")
+
+        chain: list[tuple[str, str, str]] = []
+        for no in req.report_nos:
+            row = self.db.get_report(conn, no)
+            if row is None:
+                raise ApiError(404, "report_not_found", f"报告单号 {no} 不存在")
+            if row["reg_version"] > req.version_used:
+                raise ApiError(409, "report_not_active",
+                               f"报告 {no} 在所用版 {req.version_used} 尚未登记"
+                               f"（登记于版本 {row['reg_version']}）")
+            if row["wd_version"] is not None and row["wd_version"] <= req.version_used:
+                raise ApiError(409, "report_not_active",
+                               f"报告 {no} 在所用版 {req.version_used} 已撤回"
+                               f"（撤回于版本 {row['wd_version']}）")
+            if row["wd_version"] is not None and row["wd_version"] <= latest:
+                raise ApiError(409, "report_not_active",
+                               f"报告 {no} 在当前版 {latest} 已撤回"
+                               f"（撤回于版本 {row['wd_version']}），不产生新码表")
+            chain.append((no, row["paper_a"], row["paper_b"]))
+
+        # 报告无向：从来源卷出发沿链依次走，终点须为基准卷
+        current = req.source_paper
+        for no, a, b in chain:
+            if current == a:
+                current = b
+            elif current == b:
+                current = a
+            else:
+                raise ApiError(409, "chain_broken",
+                               f"报告 {no}（{a} — {b}）与当前卷型 {current} 不相接，报告链断裂")
+        if current != req.baseline_paper:
+            raise ApiError(409, "chain_not_reaching_baseline",
+                           f"报告链终点为 {current}，未接到基准卷 {req.baseline_paper}")
+
+    def _build_result(self, conn, req: ConversionTableSubmitRequest) -> dict[str, Any]:
+        tiers = sorted(req.records, key=lambda r: r.original_score)
+        specs = [
+            conversion.TierSpec(
+                original_score=t.original_score,
+                suggested_score=t.suggested_score,
+                baseline_min=t.baseline_min,
+                baseline_max=t.baseline_max,
+                headcount=t.headcount,
+            )
+            for t in tiers
+        ]
+        try:
+            assignment, objective = conversion.solve(specs)
+        except conversion.InfeasibleError as exc:
+            raise ApiError(422, "infeasible", f"换算无解：{exc}") from exc
+
+        records_out = []
+        for t, baseline_score in zip(tiers, assignment):
+            deviation = abs(baseline_score - t.suggested_score)
+            records_out.append({
+                "original_score": t.original_score,
+                "suggested_score": t.suggested_score,
+                "baseline_min": t.baseline_min,
+                "baseline_max": t.baseline_max,
+                "headcount": t.headcount,
+                "baseline_score": baseline_score,
+                "deviation": round(deviation, 6),
+                "weighted_deviation": round(t.headcount * deviation, 6),
+            })
+
+        forward = [
+            {"original_score": t.original_score, "baseline_score": b}
+            for t, b in zip(tiers, assignment)
+        ]
+        reverse_map: dict[int, dict[str, Any]] = {}
+        for t, b in zip(tiers, assignment):
+            entry = reverse_map.setdefault(b, {"baseline_score": b,
+                                               "original_scores": [], "headcount": 0})
+            entry["original_scores"].append(t.original_score)
+            entry["headcount"] += t.headcount
+        reverse = [reverse_map[b] for b in sorted(reverse_map)]
+
+        return {
+            "table_no": req.table_no,
+            "source_paper": req.source_paper,
+            "baseline_paper": req.baseline_paper,
+            "version_used": req.version_used,
+            "version_current": self.db.latest_version(conn),
+            "report_nos": list(req.report_nos),
+            "objective": round(objective, 6),
+            "records": records_out,
+            "forward_mapping": forward,
+            "reverse_mapping": reverse,
+            "created_at": utc_now_iso(),
+            "replayed": False,
+        }
+
+    # ---------- 查询 ----------
+
+    def _load(self, conn, table_no: str) -> dict[str, Any]:
+        row = self.db.get_conversion_table(conn, table_no)
+        if row is None:
+            raise ApiError(404, "table_not_found", f"码表号 {table_no} 不存在")
+        result = json.loads(row["result_json"])
+        result["replayed"] = False
+        return result
+
+    def get_table(self, table_no: str) -> dict[str, Any]:
+        with self.db.read_connection() as conn:
+            return self._load(conn, table_no)
+
+    def list_tables(self) -> list[dict[str, Any]]:
+        with self.db.read_connection() as conn:
+            return [
+                {
+                    "table_no": r["table_no"],
+                    "source_paper": r["source_paper"],
+                    "baseline_paper": r["baseline_paper"],
+                    "version_used": r["version_used"],
+                    "version_current": r["version_current"],
+                    "objective": r["objective"],
+                    "created_at": r["created_at"],
+                }
+                for r in self.db.list_conversion_tables(conn)
+            ]
+
+    def lookup_forward(self, table_no: str, original_score: float) -> dict[str, Any]:
+        with self.db.read_connection() as conn:
+            result = self._load(conn, table_no)
+        for entry in result["forward_mapping"]:
+            if entry["original_score"] == original_score:
+                return {"table_no": table_no, **entry}
+        raise ApiError(404, "original_not_in_table",
+                       f"码表 {table_no} 中没有原分 {original_score}")
+
+    def lookup_reverse(self, table_no: str, baseline_score: int) -> dict[str, Any]:
+        with self.db.read_connection() as conn:
+            result = self._load(conn, table_no)
+        for entry in result["reverse_mapping"]:
+            if entry["baseline_score"] == baseline_score:
+                return {"table_no": table_no, **entry}
+        raise ApiError(404, "baseline_not_in_table",
+                       f"码表 {table_no} 中没有基准分 {baseline_score}")

@@ -1,4 +1,4 @@
-"""FastAPI 入口：跨校成绩入仓资格核查 API。"""
+"""FastAPI 入口：跨校成绩入仓资格核查 + 换算码表 API。"""
 
 from __future__ import annotations
 
@@ -9,8 +9,16 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from .db import Database
-from .schemas import BatchReceipt, BatchSubmitRequest, Qualification, ReportView
-from .service import ApiError, QualificationService
+from .schemas import (
+    BatchReceipt,
+    BatchSubmitRequest,
+    ConversionTableSubmitRequest,
+    ConversionTableSummary,
+    ConversionTableView,
+    Qualification,
+    ReportView,
+)
+from .service import ApiError, ConversionService, QualificationService
 
 DB_PATH = os.environ.get("QUAL_DB_PATH", "/data/qualification.db")
 
@@ -19,6 +27,7 @@ DB_PATH = os.environ.get("QUAL_DB_PATH", "/data/qualification.db")
 async def lifespan(app: FastAPI):
     app.state.db = Database(DB_PATH)
     app.state.service = QualificationService(app.state.db)
+    app.state.conversion = ConversionService(app.state.db)
     yield
 
 
@@ -27,8 +36,10 @@ app = FastAPI(
     description=(
         "教研员按批号登记/撤回等值报告；每个生效批次产生一个版本，"
         "卷型须有两条不共用报告的等值链通往基准卷才取得入仓资格。"
+        "换算码表把来源卷各原分档单调不降地换算成 0-100 整数基准分"
+        "（允许并档），发布后按码表号提供两向映射回查。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -94,3 +105,54 @@ def list_reports():
 @app.get("/reports/{report_no}", tags=["报告"], summary="按单号查报告", response_model=ReportView)
 def get_report(report_no: str):
     return app.state.service.get_report(report_no)
+
+
+# ---------- 换算码表 ----------
+
+
+@app.post(
+    "/conversion-tables",
+    tags=["码表"],
+    summary="发布换算码表（校验报告链后求解最优换算）",
+    response_model=ConversionTableView,
+)
+def submit_conversion_table(req: ConversionTableSubmitRequest):
+    return app.state.conversion.publish(req)
+
+
+@app.get(
+    "/conversion-tables",
+    tags=["码表"],
+    summary="列出全部已发布码表",
+    response_model=list[ConversionTableSummary],
+)
+def list_conversion_tables():
+    return app.state.conversion.list_tables()
+
+
+@app.get(
+    "/conversion-tables/{table_no}",
+    tags=["码表"],
+    summary="按码表号查两向映射（依据撤回/服务重启后仍可回查）",
+    response_model=ConversionTableView,
+)
+def get_conversion_table(table_no: str):
+    return app.state.conversion.get_table(table_no)
+
+
+@app.get(
+    "/conversion-tables/{table_no}/forward/{original_score}",
+    tags=["码表"],
+    summary="正向换算：原分 → 基准分",
+)
+def conversion_forward(table_no: str, original_score: float):
+    return app.state.conversion.lookup_forward(table_no, original_score)
+
+
+@app.get(
+    "/conversion-tables/{table_no}/reverse/{baseline_score}",
+    tags=["码表"],
+    summary="反向回查：基准分 → 原分列表（并档档可见全部原分）",
+)
+def conversion_reverse(table_no: str, baseline_score: int):
+    return app.state.conversion.lookup_reverse(table_no, baseline_score)
